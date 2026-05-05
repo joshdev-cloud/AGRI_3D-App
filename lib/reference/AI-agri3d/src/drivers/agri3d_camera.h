@@ -58,3 +58,25 @@ void streamTask(void *pvParameters);
  */
 bool captureFrameAtPosition(uint8_t clientNum, int idx, int total,
                             float targetX, float targetY);
+
+/**
+ * @brief Full AI inference pipeline: JPEG decode → resize → normalise → infer → broadcast.
+ *
+ * Called internally by captureFrameAtPosition() after every successful capture.
+ * Can also be called directly by the weeding routine for ad-hoc analysis.
+ *
+ * Pipeline:
+ *   1. Decode JPEG → raw RGB888 (using esp_jpg_decode / PSRAM buffer)
+ *   2. Nearest-neighbour resize → EI_CLASSIFIER_INPUT_WIDTH × EI_CLASSIFIER_INPUT_HEIGHT
+ *   3. Normalise channels to [0.0, 1.0] float
+ *   4. Call aiRunInference() on Core 1
+ *   5. Broadcast JSON {"evt":"AI_RESULT","weed":…,"confidence":…} via WebSocket
+ *
+ * @param jpegBuf  Raw JPEG bytes from esp_camera_fb_get().
+ * @param jpegLen  Length of JPEG buffer in bytes.
+ * @param gantryX  Current gantry X position (mm) — included in WebSocket payload.
+ * @param gantryY  Current gantry Y position (mm) — included in WebSocket payload.
+ */
+void aiProcessFrame(const uint8_t* jpegBuf, size_t jpegLen,
+                    float gantryX, float gantryY);
+

@@ -11,9 +11,17 @@
 #include "agri3d_sd.h"
 #include "agri3d_state.h"
 #include "../core/agri3d_logger.h"
+#include "../core/agri3d_ai.h"      // Edge Impulse inference API
 #include <ArduinoJson.h>
 #include <math.h>
 #include <time.h>
+
+// EI model input dimensions — resolved at compile time from model_variables.h
+// (included transitively via agri3d_ai.h → ei_run_classifier.h)
+#ifndef EI_CLASSIFIER_INPUT_WIDTH
+  #define EI_CLASSIFIER_INPUT_WIDTH  96
+  #define EI_CLASSIFIER_INPUT_HEIGHT 96
+#endif
 
 // ============================================================================
 // CAMERA INITIALISATION
@@ -187,15 +195,133 @@ bool captureFrameAtPosition(uint8_t clientNum, int idx, int total,
                 timeStr, targetX, targetY, fb->len,
                 sdPath[0] ? " [SD]" : "");
 
+  // ── AI Weed Detection ────────────────────────────────────────────────────
+  // Run Edge Impulse inference on the captured frame and broadcast the result.
+  aiProcessFrame(fb->buf, fb->len, targetX, targetY);
+  // ─────────────────────────────────────────────────────────────────────────
+
   return true;
 }
 
+// ============================================================================
+// AI FRAME PROCESSING PIPELINE
+// JPEG → RGB decode → nearest-neighbour resize → float normalise → EI infer
+// ============================================================================
 
-  // =========================================================================
-  // TODO(Luna): AI Hook — uncomment when ready
-  // After esp_camera_fb_get(), before return:
-  //   aiProcessFrame(fb->buf, fb->len, sysState.getX(), sysState.getY());
-// =========================================================================
+// ── JPEG decode callback state ───────────────────────────────────────────────
+struct JpegDecodeCtx {
+    uint8_t* rgbBuf;    // Output: raw RGB888 pixels (malloc'd by caller)
+    uint32_t width;     // Decoded frame width
+    uint32_t height;    // Decoded frame height
+    bool     ok;
+};
+
+// Called by esp_jpg_decode for each decoded MCU block.
+static bool jpegDecodeCallback(void* arg, uint16_t x, uint16_t y,
+                               uint16_t w, uint16_t h, uint8_t* data) {
+    JpegDecodeCtx* ctx = (JpegDecodeCtx*)arg;
+    if (!ctx || !data) return false;
+
+    for (uint16_t row = 0; row < h; row++) {
+        for (uint16_t col = 0; col < w; col++) {
+            uint32_t srcIdx  = (row * w + col) * 3;               // RGB888 from decoder
+            uint32_t dstPx   = (y + row) * ctx->width + (x + col);
+            uint32_t dstIdx  = dstPx * 3;
+            ctx->rgbBuf[dstIdx + 0] = data[srcIdx + 0]; // R
+            ctx->rgbBuf[dstIdx + 1] = data[srcIdx + 1]; // G
+            ctx->rgbBuf[dstIdx + 2] = data[srcIdx + 2]; // B
+        }
+    }
+    ctx->ok = true;
+    return true;
+}
+
+void aiProcessFrame(const uint8_t* jpegBuf, size_t jpegLen,
+                    float gantryX, float gantryY) {
+    if (!jpegBuf || jpegLen == 0) return;
+
+    // ── Step 1: Decode JPEG → raw RGB888 ────────────────────────────────────
+    // esp_jpg_decode needs to know width/height before the pixel callback fires.
+    // We use a small first-pass decode at JPEG_IMAGE_RGB888 to get dimensions.
+    uint32_t srcW = 0, srcH = 0;
+    esp_err_t dimErr = esp_jpeg_get_image_info(jpegBuf, jpegLen, &srcW, &srcH, nullptr);
+    if (dimErr != ESP_OK || srcW == 0 || srcH == 0) {
+        AgriLog(TAG_AI, LEVEL_WARN, "aiProcessFrame: JPEG info failed (0x%x)", dimErr);
+        return;
+    }
+
+    // Allocate RGB buffer in PSRAM if available (srcW * srcH * 3 bytes)
+    size_t rgbSize = srcW * srcH * 3;
+    uint8_t* rgbBuf = (uint8_t*)(psramFound()
+        ? heap_caps_malloc(rgbSize, MALLOC_CAP_SPIRAM)
+        : malloc(rgbSize));
+    if (!rgbBuf) {
+        AgriLog(TAG_AI, LEVEL_ERROR, "aiProcessFrame: RGB malloc failed (%u bytes)", rgbSize);
+        return;
+    }
+
+    JpegDecodeCtx ctx = { rgbBuf, srcW, srcH, false };
+    esp_err_t decErr = esp_jpg_decode(jpegBuf, jpegLen, JPG_SCALE_NONE,
+                                      jpegDecodeCallback, &ctx,
+                                      JPEG_IMAGE_RGB888);
+    if (decErr != ESP_OK || !ctx.ok) {
+        AgriLog(TAG_AI, LEVEL_WARN, "aiProcessFrame: JPEG decode failed (0x%x)", decErr);
+        free(rgbBuf);
+        return;
+    }
+
+    // ── Step 2: Resize to EI model input (nearest-neighbour) ─────────────────
+    const uint32_t dstW = EI_CLASSIFIER_INPUT_WIDTH;
+    const uint32_t dstH = EI_CLASSIFIER_INPUT_HEIGHT;
+    const size_t   floatCount = dstW * dstH * 3;
+
+    float* floatBuf = (float*)(psramFound()
+        ? heap_caps_malloc(floatCount * sizeof(float), MALLOC_CAP_SPIRAM)
+        : malloc(floatCount * sizeof(float)));
+    if (!floatBuf) {
+        AgriLog(TAG_AI, LEVEL_ERROR, "aiProcessFrame: float malloc failed");
+        free(rgbBuf);
+        return;
+    }
+
+    for (uint32_t row = 0; row < dstH; row++) {
+        uint32_t srcRow = (uint32_t)((float)row / dstH * srcH);
+        for (uint32_t col = 0; col < dstW; col++) {
+            uint32_t srcCol  = (uint32_t)((float)col / dstW * srcW);
+            uint32_t srcIdx  = (srcRow * srcW + srcCol) * 3;
+            uint32_t dstIdx  = (row * dstW + col) * 3;
+            // Normalise to [0.0, 1.0]
+            floatBuf[dstIdx + 0] = rgbBuf[srcIdx + 0] / 255.0f;
+            floatBuf[dstIdx + 1] = rgbBuf[srcIdx + 1] / 255.0f;
+            floatBuf[dstIdx + 2] = rgbBuf[srcIdx + 2] / 255.0f;
+        }
+    }
+    free(rgbBuf); // No longer needed
+
+    // ── Step 3: Run EI inference ──────────────────────────────────────────────
+    AiResult result = aiRunInference(floatBuf, dstW * dstH);
+    free(floatBuf);
+
+    // ── Step 4: Broadcast result to Flutter via WebSocket ─────────────────────
+    StaticJsonDocument<256> doc;
+    doc["evt"]        = "AI_RESULT";
+    doc["x"]          = gantryX;
+    doc["y"]          = gantryY;
+    doc["weed"]       = result.foundWeed;
+    doc["plant"]      = result.foundPlant;
+    doc["confidence"] = round(result.confidence * 100.0f) / 100.0f; // 2 d.p.
+    if (result.foundWeed) {
+        doc["offset_x"] = result.xOffset;
+        doc["offset_y"] = result.yOffset;
+    }
+    String out;
+    serializeJson(doc, out);
+    webSocket.broadcastTXT(out);
+
+    AgriLog(TAG_AI, LEVEL_INFO,
+            "AI @ (%.1f,%.1f): weed=%d plant=%d conf=%.2f",
+            gantryX, gantryY, result.foundWeed, result.foundPlant, result.confidence);
+}
 
 void cameraSanityCheck() {
     // If the system has been in an "invalid" state for too long
